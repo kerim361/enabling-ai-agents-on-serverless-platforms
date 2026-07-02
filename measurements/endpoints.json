@@ -1,0 +1,4 @@
+{
+  "lambda": "https://1b9qjrvgy7.execute-api.eu-central-1.amazonaws.com/chat",
+  "ec2": "http://18.197.75.4:8000/chat"
+}

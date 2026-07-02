@@ -1,0 +1,5 @@
+system,checkpoint_msgs,actual_message_count,input_chars,output_chars,est_input_tokens,est_output_tokens,est_total_tokens,latency_s
+ec2,2,2,19,259,5,65,70,0.2668
+ec2,20,20,3986,508,996,127,1124,0.7158
+ec2,60,60,12931,18,3233,4,3237,0.4086
+ec2,120,120,13886,6,3472,2,3473,0.4093

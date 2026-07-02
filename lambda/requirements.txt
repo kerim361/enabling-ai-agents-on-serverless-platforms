@@ -1,0 +1,3 @@
+# Keine externen Pakete nötig.
+# boto3 ist in der Lambda-Runtime vorinstalliert.
+# Ollama-Calls laufen über urllib (Python stdlib).

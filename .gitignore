@@ -1,0 +1,22 @@
+# virtual environments & caches
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# secrets — never commit
+.groq_key
+
+# local runtime state
+.session_id
+local-chatbot/sessions/
+ec2-chatbot/data/
+*.db
+
+# deployment build artifacts
+lambda_package.zip
+setup/output.json
+
+# superseded local notes (outdated paths/structure; replaced by README.md)
+TUT.md
+PROJEKTDOKUMENTATION.md
