@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import List
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -130,7 +132,7 @@ def list_sessions(limit: int = 100) -> List[dict]:
 # Groq API
 # --------------------------------------------------------------------------
 
-def call_groq(messages: list) -> str:
+def call_groq(messages: list) -> tuple:
     response = requests.post(
         GROQ_URL,
         json={
@@ -145,16 +147,22 @@ def call_groq(messages: list) -> str:
         timeout=60,
     )
     response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    data = response.json()
+    # Echte Token-Zahlen, wie von der Groq-API abgerechnet
+    usage = data.get("usage", {}) or {}
+    return data["choices"][0]["message"]["content"], {
+        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+    }
 
 
 # --------------------------------------------------------------------------
 # Context compression
 # --------------------------------------------------------------------------
 
-def maybe_summarize(history: list) -> list:
+def maybe_summarize(history: list) -> tuple:
     if len(history) <= SUMMARY_THRESHOLD:
-        return history
+        return history, None
 
     existing_summaries = [
         msg for msg in history
@@ -172,7 +180,7 @@ def maybe_summarize(history: list) -> list:
     to_compress = normal_messages[:COMPRESS_COUNT]
     remaining = normal_messages[COMPRESS_COUNT:]
 
-    summary_text = summarize_messages(to_compress)
+    summary_text, summary_usage = summarize_messages(to_compress)
     new_summary = {
         "role": "system",
         "content": (
@@ -180,10 +188,10 @@ def maybe_summarize(history: list) -> list:
             f"{summary_text}"
         ),
     }
-    return existing_summaries + [new_summary] + remaining
+    return existing_summaries + [new_summary] + remaining, summary_usage
 
 
-def summarize_messages(messages: list) -> str:
+def summarize_messages(messages: list) -> tuple:
     formatted = "\n".join(f"{message['role'].upper()}: {message['content']}" for message in messages)
     prompt = [
         {
@@ -204,18 +212,25 @@ def summarize_messages(messages: list) -> str:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "ec2-chatbot"}
+    import platform
+    return {"status": "ok", "service": "ec2-chatbot",
+            "python_version": platform.python_version()}
+
+
+@app.exception_handler(RequestValidationError)
+def validation_error_as_400(request, exc):
+    # Gleiche Fehlersemantik wie das Lambda-Backend (400 statt FastAPI-422)
+    return JSONResponse(status_code=400, content={"detail": "Ungueltiger JSON-Body"})
 
 
 @app.post("/chat")
-async def chat(request: Request) -> dict:
+def chat(body: dict = Body(...)) -> dict:
+    # Bewusst ein synchroner Handler: FastAPI führt ihn im Threadpool aus,
+    # sodass parallele Requests nebeneinander laufen (klassisches
+    # Server-Modell). Ein async-Handler mit blockierendem HTTP-Client würde
+    # den Event-Loop blockieren und Parallelität künstlich serialisieren.
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY ist nicht gesetzt")
-
-    try:
-        body = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Ungueltiger JSON-Body") from exc
 
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Ungueltiger JSON-Body")
@@ -236,13 +251,18 @@ async def chat(request: Request) -> dict:
     if not session_id or not user_message:
         raise HTTPException(status_code=400, detail="session_id und message sind Pflichtfelder")
 
+    # Jede Phase wird einzeln gemessen (identisch zum Lambda-Backend), damit
+    # der State-Store-Overhead als Messwert berichtet werden kann.
+    t0 = time.perf_counter()
     history = load_history(session_id)
+    t_load = time.perf_counter() - t0
+
     history.append({"role": "user", "content": user_message})
 
     try:
-        started_at = time.perf_counter()
-        assistant_message = call_groq(history)
-        elapsed_seconds = time.perf_counter() - started_at
+        t0 = time.perf_counter()
+        assistant_message, usage = call_groq(history)
+        t_llm = time.perf_counter() - t0
     except requests.exceptions.HTTPError as exc:
         error_text = exc.response.text if exc.response is not None else str(exc)
         raise HTTPException(status_code=502, detail=f"Groq API Fehler: {error_text}") from exc
@@ -252,15 +272,31 @@ async def chat(request: Request) -> dict:
         raise HTTPException(status_code=502, detail="Verbindungsfehler zu Groq") from exc
 
     history.append({"role": "assistant", "content": assistant_message})
-    history = maybe_summarize(history)
-    save_history(session_id, history)
 
-    return {
+    t0 = time.perf_counter()
+    history, compression_usage = maybe_summarize(history)
+    t_compress = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    save_history(session_id, history)
+    t_store = time.perf_counter() - t0
+
+    result = {
         "response": assistant_message,
         "session_id": session_id,
         "message_count": len(history),
-        "elapsed_seconds": round(elapsed_seconds, 2),
+        "usage": usage,
+        "timings_ms": {
+            "load": round(t_load * 1000, 2),
+            "llm": round(t_llm * 1000, 2),
+            "compress": round(t_compress * 1000, 2),
+            "store": round(t_store * 1000, 2),
+        },
+        "compressed": compression_usage is not None,
     }
+    if compression_usage is not None:
+        result["compression_usage"] = compression_usage
+    return result
 
 
 @app.get("/")

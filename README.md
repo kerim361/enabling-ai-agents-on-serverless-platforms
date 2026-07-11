@@ -22,7 +22,10 @@ interface and use the same LLM (`llama-3.3-70b-versatile` via the Groq API):
 | Region | `eu-central-1` (Frankfurt) | `eu-central-1` (Frankfurt) |
 
 Both are compared on **latency, cold starts, scaling with conversation
-length, and cost** (Experiments 1–5, see [`measurements/`](measurements/)).
+length, cost, and concurrent load** (Experiments 1–6, see
+[`measurements/`](measurements/)). Both backends are instrumented: every
+response carries the provider-reported token usage and per-phase server
+timings (state load, LLM call, compression, state store).
 
 ### How the agent works
 
@@ -42,8 +45,10 @@ lambda/          Serverless backend: AWS Lambda handler (stdlib + boto3 only)
 ec2-chatbot/     Server baseline: FastAPI + SQLite (see its README)
 local-chatbot/   Local variant: same agent loop, JSON-file state, no AWS needed
 client/          Interactive CLI client (measures end-to-end latency per turn)
-setup/           deploy.sh — idempotent AWS deployment + IAM policies
-measurements/    Measurement harness, raw data (CSV), analysis & figures
+setup/           deploy.sh (serverless stack) + deploy_ec2.sh (baseline
+                 instance via user-data bootstrap) + IAM policies
+measurements/    Measurement harness (exp1–exp6), campaign script, raw data
+                 (CSV + Lambda REPORT log), analysis & figures
 ```
 
 ## Quickstart
@@ -103,8 +108,17 @@ python chatbot.py
 
 ### Option C — server baseline (EC2 / any Linux host)
 
-See [`ec2-chatbot/README.md`](ec2-chatbot/README.md) for local usage and the
-systemd deployment used in the evaluation.
+The baseline instance used in the evaluation is deployed fully automatically:
+
+```bash
+cd setup
+export GROQ_API_KEY="gsk_..."
+./deploy_ec2.sh        # t3.micro + Python 3.12 + systemd service, prints URL
+```
+
+Remember to terminate the instance afterwards (the script prints the
+command). See [`ec2-chatbot/README.md`](ec2-chatbot/README.md) for running
+the baseline locally instead.
 
 ## Reproducing the evaluation
 
@@ -114,7 +128,8 @@ raw CSVs of the reported campaign, and the plotting script — is documented in
 
 ```bash
 cd measurements
-python3 measure.py --system lambda exp1 --n 20     # …exp1–exp5, per system
+./run_campaign.sh                                   # full campaign, both systems
+# or individually: python3 measure.py --system lambda exp1 --n 20   (exp1–exp6)
 ./venv/bin/python analyze.py                        # aggregates + renders figures
 ```
 
@@ -122,14 +137,19 @@ Headline results from the campaign reported in the thesis:
 
 | Metric | Lambda (serverless) | EC2 (server) |
 |--------|---------------------|--------------|
-| Warm latency (mean) | 0.476 s | 0.505 s |
-| Cold-start latency (mean) | 1.248 s | — (always warm) |
+| Warm latency (mean, n=20) | 0.460 s | 0.422 s |
+| State access per turn (measured) | 16.8 ms (DynamoDB) | 7.3 ms (SQLite) |
+| Cold-start latency (mean, n=20) | 1.205 s | — (always warm) |
+| Concurrent sessions | linear scaling, stable p50, up to account quota | linear up to c=20 |
 
-Under warm conditions the two architectures are statistically comparable; the
-serverless model's distinct costs are the cold-start penalty and per-request
-state re-transfer, the latter bounded by history compression. The LLM call
-dominates per-turn cost (~99 %); the serverless infrastructure (Lambda +
-DynamoDB) contributes less than one percent.
+Under warm conditions the two architectures are statistically
+indistinguishable — the measured price of state externalization is ~10 ms per
+turn, hidden beneath the LLM call's own variance. Cold starts cost ~0.57 s of
+latency but no money (the init phase is not billed). Token usage grows with
+conversation length on both architectures alike and is bounded by history
+compression. The LLM call dominates per-turn cost (>99 %); the entire
+serverless infrastructure (API Gateway + Lambda + DynamoDB) contributes
+about 0.7 %.
 
 ## Cost note
 

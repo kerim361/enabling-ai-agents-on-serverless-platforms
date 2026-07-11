@@ -1,5 +1,6 @@
 import json
 import boto3
+import time
 import urllib.request
 import urllib.error
 import os
@@ -46,26 +47,50 @@ def lambda_handler(event, context):
     if not session_id or not user_message:
         return _response(400, {"error": "session_id und message sind Pflichtfelder"})
 
+    # Jede Phase wird einzeln gemessen, damit der Overhead des externalisierten
+    # State (DynamoDB) als Messwert und nicht nur als Annahme berichtet werden kann.
+    t0 = time.perf_counter()
     history = _load_history(session_id)
+    t_load = time.perf_counter() - t0
+
     history.append({"role": "user", "content": user_message})
 
     try:
-        assistant_message = _call_groq(history)
+        t0 = time.perf_counter()
+        assistant_message, usage = _call_groq(history)
+        t_llm = time.perf_counter() - t0
     except Exception as e:
         return _response(502, {"error": f"Groq API Fehler: {str(e)}"})
 
     history.append({"role": "assistant", "content": assistant_message})
 
     # Nach jeder Antwort prüfen ob Komprimierung nötig ist
-    history = _maybe_summarize(history)
+    t0 = time.perf_counter()
+    history, compression_usage = _maybe_summarize(history)
+    t_compress = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     _save_history(session_id, history)
+    t_store = time.perf_counter() - t0
 
-    return _response(200, {
+    result = {
         "response": assistant_message,
         "session_id": session_id,
         "message_count": len(history),
-    })
+        # Echte Token-Zahlen aus der Groq-API (statt chars/4-Schätzung)
+        "usage": usage,
+        # Serverseitige Phasen-Timings in Millisekunden
+        "timings_ms": {
+            "load": round(t_load * 1000, 2),
+            "llm": round(t_llm * 1000, 2),
+            "compress": round(t_compress * 1000, 2),
+            "store": round(t_store * 1000, 2),
+        },
+        "compressed": compression_usage is not None,
+    }
+    if compression_usage is not None:
+        result["compression_usage"] = compression_usage
+    return _response(200, result)
 
 
 def _list_sessions(limit: int) -> list:
@@ -110,7 +135,7 @@ def _maybe_summarize(history: list) -> list:
     einzelne System-Nachricht ersetzt.
     """
     if len(history) <= SUMMARY_THRESHOLD:
-        return history
+        return history, None
 
     # Bestehende Zusammenfassungen und normale Nachrichten trennen
     existing_summaries = [
@@ -130,7 +155,7 @@ def _maybe_summarize(history: list) -> list:
     to_compress = normal_messages[:COMPRESS_COUNT]
     remaining   = normal_messages[COMPRESS_COUNT:]
 
-    summary_text = _summarize_messages(to_compress)
+    summary_text, summary_usage = _summarize_messages(to_compress)
     new_summary = {
         "role": "system",
         "content": (
@@ -140,10 +165,10 @@ def _maybe_summarize(history: list) -> list:
     }
 
     # Aufbau: alle alten Zusammenfassungen + neue Zusammenfassung + verbleibende Nachrichten
-    return existing_summaries + [new_summary] + remaining
+    return existing_summaries + [new_summary] + remaining, summary_usage
 
 
-def _summarize_messages(messages: list) -> str:
+def _summarize_messages(messages: list) -> tuple:
     formatted = "\n".join(
         f"{m['role'].upper()}: {m['content']}" for m in messages
     )
@@ -158,7 +183,7 @@ def _summarize_messages(messages: list) -> str:
     return _call_groq(prompt)
 
 
-def _call_groq(messages: list) -> str:
+def _call_groq(messages: list) -> tuple:
     payload = json.dumps({
         "model": GROQ_MODEL,
         "messages": messages,
@@ -183,7 +208,12 @@ def _call_groq(messages: list) -> str:
         error_body = e.read().decode("utf-8")
         raise Exception(f"HTTP {e.code} von Groq: {error_body}")
 
-    return data["choices"][0]["message"]["content"]
+    # Echte Token-Zahlen, wie von der Groq-API abgerechnet
+    usage = data.get("usage", {}) or {}
+    return data["choices"][0]["message"]["content"], {
+        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+    }
 
 
 def _load_history(session_id: str) -> list:

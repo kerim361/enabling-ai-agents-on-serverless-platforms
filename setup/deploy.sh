@@ -148,6 +148,8 @@ else
         --zip-file "fileb://$ZIP_FILE" \
         --region "$REGION" \
         --output text > /dev/null
+    # Warten bis das Code-Update abgeschlossen ist (sonst ResourceConflict)
+    aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
     # Umgebungsvariablen aktualisieren
     aws lambda update-function-configuration \
         --function-name "$FUNCTION_NAME" \
